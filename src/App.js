@@ -7,6 +7,54 @@ import { CognitoIdentityClient } from '@aws-sdk/client-cognito-identity';
 import { REGION, USER_POOL_ID, IDENTITY_POOL_ID, BUCKET_NAME } from './config';
 import './App.css';
 
+// Utility functions for email parsing
+const decodeMimeHeader = (header) => {
+  if (!header) return '';
+  
+  // Handle multiple MIME encoded parts
+  let decoded = header.replace(/=\?UTF-8\?([BQ])\?([^?]*)\?=/gi, (match, encoding, encoded) => {
+    try {
+      if (encoding.toUpperCase() === 'B') {
+        // Base64 decoding
+        const binary = atob(encoded.replace(/\s/g, ''));
+        // Convert binary string to UTF-8
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        const decoded = new TextDecoder('utf-8').decode(bytes);
+        // Remove any zero-width spaces or other invisible characters
+        return decoded.replace(/[\u200B-\u200D\uFEFF]/g, '');
+      } else {
+        // Quoted-Printable decoding
+        return encoded
+          .replace(/=([0-9A-F]{2})/gi, (_, hex) => {
+            return String.fromCharCode(parseInt(hex, 16));
+          })
+          .replace(/_/g, ' ');
+      }
+    } catch (err) {
+      console.error('Error decoding MIME header:', err);
+      return match;
+    }
+  });
+
+  // Clean up any remaining encoding artifacts and spaces
+  return decoded
+    .replace(/\u00E2\u0080\u0099/g, "'")  // Replace UTF-8 encoded apostrophe
+    .replace(/\u00E2\u0080\u009C/g, '"')  // Replace UTF-8 encoded left quote
+    .replace(/\u00E2\u0080\u009D/g, '"')  // Replace UTF-8 encoded right quote
+    .replace(/\u00E2\u0080\u0093/g, '–')  // Replace UTF-8 encoded en dash
+    .replace(/\u00E2\u0080\u0094/g, '—')  // Replace UTF-8 encoded em dash
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')  // Remove zero-width spaces and other invisible characters
+    .replace(/\s+/g, ' ')                 // Normalize spaces
+    .replace(/\s+([.,;:!?])/g, '$1')      // Remove spaces before punctuation
+    .replace(/([.,;:!?])\s+/g, '$1 ')     // Ensure single space after punctuation
+    .replace(/\s+([a-z])/g, ' $1')        // Ensure space before lowercase letters
+    .replace(/([a-z])\s+([A-Z])/g, '$1 $2') // Ensure space between words
+    .trim();
+};
+
 function EmailReviewer({ emailKey, onVerdictSubmit, auth }) {
   const [emailContent, setEmailContent] = useState(null);
   const [parsedEmail, setParsedEmail] = useState(null);
@@ -116,18 +164,15 @@ function EmailReviewer({ emailKey, onVerdictSubmit, auth }) {
       headerLines.forEach(line => {
         // Handle multi-line headers
         if (line.startsWith(' ') || line.startsWith('\t')) {
-          // This is a continuation of the previous header
           if (currentHeader) {
             currentValue += ' ' + line.trim();
             headers[currentHeader] = decodeEmailContent(currentValue);
           }
         } else {
-          // If we have a previous header, save it
           if (currentHeader) {
             headers[currentHeader] = decodeEmailContent(currentValue);
           }
           
-          // Start new header
           const match = line.match(/^([^:]+):\s*(.*)$/);
           if (match) {
             const [, key, value] = match;
@@ -138,84 +183,105 @@ function EmailReviewer({ emailKey, onVerdictSubmit, auth }) {
         }
       });
 
-      // Save the last header if exists
       if (currentHeader) {
         headers[currentHeader] = decodeEmailContent(currentValue);
       }
+
+      console.log('Content-Type header:', headers['Content-Type']); // Debug log
 
       // Extract MIME parts
       let plainText = '';
       let htmlContent = '';
       
-      if (headers['Content-Type']?.includes('multipart/alternative')) {
-        // Split by MIME boundary
-        const boundary = headers['Content-Type'].match(/boundary="([^"]+)"/)?.[1];
-        if (boundary) {
-          const mimeParts = body.split(`--${boundary}`);
+      // Check if it's a multipart message
+      if (headers['Content-Type']?.toLowerCase().includes('multipart')) {
+        console.log('Processing multipart message'); // Debug log
+        const boundaryMatch = headers['Content-Type'].match(/boundary="?([^";\s]+)"?/i);
+        if (boundaryMatch) {
+          const boundary = boundaryMatch[1];
+          console.log('Found boundary:', boundary); // Debug log
           
-          mimeParts.forEach(part => {
-            if (part.includes('Content-Type: text/plain')) {
-              // Extract plain text content
-              const textMatch = part.match(/Content-Type: text\/plain[^]*?\n\n([^]*?)(?=--|$)/s);
+          const mimeParts = body.split(`--${boundary}`);
+          console.log('Number of MIME parts:', mimeParts.length); // Debug log
+          
+          mimeParts.forEach((part, index) => {
+            console.log(`Processing part ${index}:`, part.substring(0, 100)); // Debug log first 100 chars
+            
+            if (part.toLowerCase().includes('content-type: text/plain')) {
+              const textMatch = part.match(/Content-Type: text\/plain[^]*?\n\n([^]*?)(?=--|$)/is);
               if (textMatch) {
                 plainText = decodeEmailContent(textMatch[1].trim());
+                console.log('Found plain text content'); // Debug log
               }
-            } else if (part.includes('Content-Type: text/html')) {
-              // Extract HTML content
-              const htmlMatch = part.match(/Content-Type: text\/html[^]*?\n\n([^]*?)(?=--|$)/s);
+            } else if (part.toLowerCase().includes('content-type: text/html')) {
+              const htmlMatch = part.match(/Content-Type: text\/html[^]*?\n\n([^]*?)(?=--|$)/is);
               if (htmlMatch) {
                 htmlContent = decodeEmailContent(htmlMatch[1].trim());
+                console.log('Found HTML content'); // Debug log
               }
             }
           });
         }
+      } else if (headers['Content-Type']?.toLowerCase().includes('text/html')) {
+        // Direct HTML content
+        console.log('Processing direct HTML content'); // Debug log
+        htmlContent = decodeEmailContent(body);
       } else {
-        // Not multipart, use the body as is
+        // Plain text content
+        console.log('Processing plain text content'); // Debug log
         plainText = decodeEmailContent(body);
       }
 
-      // Clean up HTML content
-      let cleanHtml = htmlContent;
+      console.log('HTML content found:', !!htmlContent); // Debug log
+      console.log('Plain text content found:', !!plainText); // Debug log
+
+      // Clean up HTML content if we have it
       if (htmlContent) {
-        cleanHtml = htmlContent
-          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '') // Remove style tags
-          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '') // Remove script tags
-          .replace(/<div[^>]*>/gi, '') // Remove div tags
-          .replace(/<\/div>/gi, '\n') // Replace closing divs with newlines
-          .replace(/<br\s*\/?>/gi, '\n') // Replace br tags with newlines
-          .replace(/<[^>]+>/g, '') // Remove other HTML tags
-          .replace(/\n\s*\n/g, '\n\n') // Normalize multiple newlines
+        // Remove potentially dangerous elements and attributes
+        const cleanHtml = htmlContent
+          .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '') // Remove script tags
+          .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '') // Remove style tags
+          .replace(/on\w+="[^"]*"/g, '') // Remove on* attributes
+          .replace(/on\w+='[^']*'/g, '') // Remove on* attributes with single quotes
+          .replace(/javascript:/gi, '') // Remove javascript: URLs
           .trim();
+        
+        htmlContent = cleanHtml;
       }
 
       // Use HTML content if available, otherwise use plain text
-      const displayContent = cleanHtml || plainText;
+      const displayContent = htmlContent || plainText;
+      const isHtml = !!htmlContent;
 
-      // Extract date from headers
-      let date = 'Unknown date';
-      if (headers['Date']) {
-        try {
-          const dateObj = new Date(headers['Date']);
-          if (!isNaN(dateObj.getTime())) {
-            date = dateObj.toLocaleString();
-          }
-        } catch (e) {
-          console.error('Error parsing date:', e);
+      console.log('Final content type:', isHtml ? 'HTML' : 'Plain text'); // Debug log
+
+      // After parsing headers, decode any MIME encoded headers
+      const decodedHeaders = {};
+      for (const [key, value] of Object.entries(headers)) {
+        // Handle multiple encoded parts in the same header
+        let decodedValue = value;
+        let lastDecoded = '';
+        // Keep decoding until no more changes (handles multiple encoded parts)
+        while (decodedValue !== lastDecoded) {
+          lastDecoded = decodedValue;
+          decodedValue = decodeMimeHeader(decodedValue);
         }
+        decodedHeaders[key] = decodedValue;
       }
 
       const parsed = {
-        headers,
+        headers: decodedHeaders,  // Use decoded headers
         body: displayContent,
-        isHtml: !!htmlContent,
-        date: date,
-        from: headers['From'] || 'Unknown sender',
-        to: headers['To'] || 'Unknown recipient',
-        subject: headers['Subject'] || 'No subject',
+        isHtml,
+        date: decodedHeaders['Date'] || 'Unknown date',
+        from: decodedHeaders['From'] || 'Unknown sender',
+        to: decodedHeaders['To'] || 'Unknown recipient',
+        subject: decodedHeaders['Subject'] || 'No subject',
         rawContent: content,
       };
 
-      console.log('Final parsed result:', parsed);
+      console.log('Decoded subject:', decodedHeaders['Subject']); // Debug log
+
       return parsed;
     } catch (err) {
       console.error('Error parsing email:', err);
@@ -269,11 +335,10 @@ function EmailReviewer({ emailKey, onVerdictSubmit, auth }) {
         </div>
         <div className="email-body">
           {parsedEmail.isHtml ? (
-            <div className="html-content">
-              {parsedEmail.body.split('\n').map((line, i) => (
-                <p key={i}>{line}</p>
-              ))}
-            </div>
+            <div 
+              className="html-content"
+              dangerouslySetInnerHTML={{ __html: parsedEmail.body }}
+            />
           ) : (
             <pre>{parsedEmail.body}</pre>
           )}
@@ -371,10 +436,22 @@ function App() {
         headers[currentHeader] = currentValue;
       }
 
+      // Decode headers using the same function as the email preview
+      const decodedHeaders = {};
+      for (const [key, value] of Object.entries(headers)) {
+        let decodedValue = value;
+        let lastDecoded = '';
+        while (decodedValue !== lastDecoded) {
+          lastDecoded = decodedValue;
+          decodedValue = decodeMimeHeader(decodedValue);
+        }
+        decodedHeaders[key] = decodedValue;
+      }
+
       return {
-        subject: headers['Subject'] || 'No Subject',
-        from: headers['From'] || 'Unknown Sender',
-        date: headers['Date'] || 'Unknown Date',
+        subject: decodedHeaders['Subject'] || 'No Subject',
+        from: decodedHeaders['From'] || 'Unknown Sender',
+        date: decodedHeaders['Date'] || 'Unknown Date',
       };
     } catch (err) {
       console.error('Error fetching email metadata:', err);
