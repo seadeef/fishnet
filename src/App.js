@@ -55,6 +55,19 @@ const decodeMimeHeader = (header) => {
     .trim();
 };
 
+// Add auth error handling component
+function AuthError({ error, onRetry }) {
+  return (
+    <div className="auth-error">
+      <h2>Authentication Error</h2>
+      <p>{error.message}</p>
+      <button onClick={onRetry} className="retry-button">
+        Retry Login
+      </button>
+    </div>
+  );
+}
+
 function EmailReviewer({ emailKey, onVerdictSubmit, auth }) {
   const [emailContent, setEmailContent] = useState(null);
   const [parsedEmail, setParsedEmail] = useState(null);
@@ -380,6 +393,24 @@ function App() {
   const [emailMetadata, setEmailMetadata] = useState({});
   const [error, setError] = useState(null);
   const [selectedEmail, setSelectedEmail] = useState(null);
+  const [authError, setAuthError] = useState(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  // Handle auth state changes
+  useEffect(() => {
+    if (auth.error) {
+      console.error('Auth error:', auth.error);
+      setAuthError(auth.error);
+    } else {
+      setAuthError(null);
+    }
+  }, [auth.error]);
+
+  // Handle retry login
+  const handleRetryLogin = () => {
+    setAuthError(null);
+    auth.signinRedirect();
+  };
 
   // Function to fetch email metadata
   const fetchEmailMetadata = async (key) => {
@@ -463,38 +494,54 @@ function App() {
     }
   };
 
-  useEffect(() => {
-    if (!auth.isAuthenticated) return;
-
-    const client = new S3Client({
-      region: REGION,
-      credentials: fromCognitoIdentityPool({
-        client: new CognitoIdentityClient({ region: REGION }),
-        identityPoolId: IDENTITY_POOL_ID,
-        logins: {
-          [`cognito-idp.${REGION}.amazonaws.com/${USER_POOL_ID}`]: auth.user.id_token,
-        },
-      }),
-    });
-
-    // List all objects in the bucket
-    client.send(new ListObjectsV2Command({ Bucket: BUCKET_NAME }))
-      .then(async data => {
-        const keys = data.Contents?.map(o => o.Key) || [];
-        setKeys(keys);
-        
-        // Fetch metadata for each email
-        const metadata = {};
-        for (const key of keys) {
-          metadata[key] = await fetchEmailMetadata(key);
-        }
-        setEmailMetadata(metadata);
-      })
-      .catch(err => {
-        console.error('Error listing S3 objects:', err);
-        setError(err.message || 'Unknown error');
+  // Function to fetch emails
+  const fetchEmails = async () => {
+    setIsRefreshing(true);
+    setError(null);
+    try {
+      const client = new S3Client({
+        region: REGION,
+        credentials: fromCognitoIdentityPool({
+          client: new CognitoIdentityClient({ region: REGION }),
+          identityPoolId: IDENTITY_POOL_ID,
+          logins: {
+            [`cognito-idp.${REGION}.amazonaws.com/${USER_POOL_ID}`]: auth.user.id_token,
+          },
+        }),
       });
-  }, [auth]);
+
+      const data = await client.send(new ListObjectsV2Command({ Bucket: BUCKET_NAME }));
+      const keys = data.Contents?.map(o => o.Key) || [];
+      
+      // Fetch metadata for each email
+      const metadata = {};
+      for (const key of keys) {
+        metadata[key] = await fetchEmailMetadata(key);
+      }
+      
+      // Sort keys based on date
+      const sortedKeys = [...keys].sort((a, b) => {
+        const dateA = new Date(metadata[a].date);
+        const dateB = new Date(metadata[b].date);
+        return dateB - dateA; // Sort in descending order (newest first)
+      });
+
+      setKeys(sortedKeys);
+      setEmailMetadata(metadata);
+    } catch (err) {
+      console.error('Error fetching emails:', err);
+      setError(err.message || 'Failed to fetch emails');
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  // Initial fetch
+  useEffect(() => {
+    if (auth.isAuthenticated) {
+      fetchEmails();
+    }
+  }, [auth.isAuthenticated]);
 
   const handleVerdictSubmit = async (emailKey, verdict, comment) => {
     try {
@@ -534,14 +581,30 @@ function App() {
     }
   };
 
-  if (auth.isLoading) return <div className="loading">Loading authentication...</div>;
-  if (auth.error) return <div className="error">Error: {auth.error.message}</div>;
+  if (auth.isLoading) {
+    return (
+      <div className="loading">
+        <div className="loading-spinner"></div>
+        <p>Loading authentication...</p>
+      </div>
+    );
+  }
+
+  if (authError) {
+    return <AuthError error={authError} onRetry={handleRetryLogin} />;
+  }
 
   if (!auth.isAuthenticated) {
     return (
       <div className="login-container">
         <h1>Fishnet</h1>
-        <button onClick={() => auth.signinRedirect()} className="login-button">
+        <button 
+          onClick={() => {
+            setAuthError(null);
+            auth.signinRedirect();
+          }} 
+          className="login-button"
+        >
           Sign In
         </button>
       </div>
@@ -562,7 +625,24 @@ function App() {
 
       <main className="main-content">
         <div className="email-list">
-          <h2>Pending Reviews</h2>
+          <div className="email-list-header">
+            <h2>Pending Reviews</h2>
+            <button 
+              onClick={fetchEmails} 
+              className="refresh-button"
+              disabled={isRefreshing}
+              title="Refresh emails"
+            >
+              <svg 
+                className={`refresh-icon ${isRefreshing ? 'spinning' : ''}`} 
+                viewBox="0 0 24 24" 
+                width="24" 
+                height="24"
+              >
+                <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
+              </svg>
+            </button>
+          </div>
           {error && <p className="error">Error: {error}</p>}
           {!error && keys.length === 0 ? (
             <p className="no-emails">No emails to review</p>
